@@ -1,0 +1,88 @@
+#!/bin/env python3
+
+import os
+import sys
+import pyinotify
+import configparser
+import json
+import subprocess
+
+if len(sys.argv) != 2:
+    print('Usage: {} [user name]'.format(sys.argv[0]))
+    exit(1)
+
+oc_user = sys.argv[1]
+
+def read_config():
+    config = configparser.ConfigParser()
+    with open('/etc/owncloud-monitor/monitor.conf', 'r') as cfg_file:
+        cfg_str = '[default]\n{}'.format(cfg_file.read())
+        config.read_string(cfg_str)
+    return config
+
+
+def read_oc_config(path):
+    owncloud_cfg = subprocess.check_output(['php', '-r', 'include "{}"; echo json_encode($CONFIG);'.format(path)])
+    return json.loads(owncloud_cfg)
+
+
+def get_watch_dir(datadir):
+    return '{}/{}/files'.format(datadir, oc_user)
+
+
+def get_occ_path_scan_cmd(occ_user, oc_dir):
+    occ_uid = int(subprocess.check_output(['id', '-u', occ_user]))
+    occ_gid = int(subprocess.check_output(['id', '-g', occ_user]))
+
+    def sudou():
+        os.setgid(occ_gid)
+        os.setuid(occ_uid)
+
+    def scan(path):
+        return subprocess.run([os.path.join(oc_dir, 'occ'), 'files:scan', '-q', '-p', path], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, preexec_fn=sudou).returncode
+
+    return scan
+
+
+def get_path_extractor(oc_dir):
+    if oc_dir.endswith(os.path.sep):
+        oc_dir = oc_dir[:-1]
+    l = len(oc_dir)
+
+    def extractor(path):
+        return path[l:]
+    
+    return extractor
+
+
+cfg = read_config()
+oc_dir = cfg['default']['OWNCLOUD_DIR']
+occ_user = cfg['default']['OC_USER']
+owncloud_cfg = read_oc_config(os.path.join(oc_dir, 'config', 'config.php'))
+data_dir = owncloud_cfg['datadirectory']
+watch_dir = get_watch_dir(data_dir)
+
+scan = get_occ_path_scan_cmd(occ_user, oc_dir)
+path_extractor =  get_path_extractor(data_dir)
+
+wm = pyinotify.WatchManager()
+mask = pyinotify.IN_DELETE | pyinotify.IN_CREATE | pyinotify.IN_ISDIR
+
+class OwncloudScannerHandler(pyinotify.ProcessEvent):
+    def my_init(self, watch_manager):
+        self.wm = watch_manager
+
+    def process_IN_CREATE(self, event):
+        if event.dir:
+            self.wm.add_watch(event.pathname, mask, rec=True)
+        scan(path_extractor(event.pathname))
+
+    def process_IN_DELETE(self, event):
+        scan(path_extractor(event.pathname))
+
+
+handler = OwncloudScannerHandler(watch_manager=wm)
+notifier = pyinotify.Notifier(wm, handler)
+wm.add_watch('{}/{}/files'.format(data_dir, oc_user), mask, rec=True)
+
+notifier.loop()
